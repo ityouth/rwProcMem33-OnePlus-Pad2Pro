@@ -3,221 +3,390 @@ name: Build rwProcMem33 Module for OnePlus Pad 2 Pro
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
+
+env:
+  KERNEL_VERSION: "6.6"
+  ANDROID_VERSION: "15"
+  TARGET_DEVICE: "OnePlus Pad 2 Pro (OPD2413)"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel_source: 
+          - "https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git"
+          - "https://github.com/LineageOS/android_kernel_oneplus_sm8750.git"
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
       
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get clean
+        df -h
+        
     - name: Setup build environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential git bc bison flex libssl-dev libncurses5-dev curl
+        sudo apt-get install -y \
+          build-essential git bc bison flex libssl-dev libncurses5-dev \
+          curl wget unzip python3 python3-pip \
+          gcc-aarch64-linux-gnu \
+          libc6-dev-arm64-cross \
+          crossbuild-essential-arm64
         
-    - name: Download Android NDK
-      run: |
-        cd /tmp
-        wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip
-        unzip -q android-ndk-r26c-linux.zip
-        sudo mv android-ndk-r26c /opt/
-        echo "/opt/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        # 显示工具版本
+        aarch64-linux-gnu-gcc --version
+        echo "Build environment ready"
         
-    - name: Download OnePlus Official Kernel Source
+    - name: Setup toolchain
       run: |
-        echo "Downloading OnePlus Official SM8750 kernel source..."
-        # 尝试多个内核源
-        if ! git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git kernel_source; then
-          echo "Primary source failed, trying alternative..."
-          git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750.git kernel_source || \
-          git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel_source
+        # 使用系统自带的交叉编译工具链，更稳定
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export ARCH=arm64
+        
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        
+        # 验证工具链
+        aarch64-linux-gnu-gcc --version
+        which aarch64-linux-gnu-gcc
+        
+    - name: Download kernel source
+      run: |
+        echo "=== Downloading kernel source ==="
+        echo "Trying source: ${{ matrix.kernel_source }}"
+        
+        # 下载内核源码
+        if git clone --depth=1 --single-branch ${{ matrix.kernel_source }} kernel_source; then
+          echo "✓ Successfully cloned kernel source"
+        else
+          echo "✗ Failed to clone from ${{ matrix.kernel_source }}"
+          
+          # 备用方案：使用通用Android内核
+          echo "Trying generic Android kernel..."
+          git clone --depth=1 https://github.com/aosp-mirror/kernel_common.git kernel_source
         fi
-        cd kernel_source
-        echo "Available branches:"
-        git branch -a | head -10
-        echo "Latest commit:"
-        git log --oneline -1
         
-    - name: Prepare module build
+        cd kernel_source
+        echo "Kernel source info:"
+        echo "- Repository: $(git config --get remote.origin.url)"
+        echo "- Latest commit: $(git log --oneline -1)"
+        echo "- Available configs:"
+        find arch/arm64/configs/ -name "*.config" -o -name "*defconfig" | head -10 || echo "No configs found"
+        
+        # 检查内核版本
+        if [ -f Makefile ]; then
+          echo "- Kernel version: $(make kernelversion 2>/dev/null || echo 'unknown')"
+        fi
+        
+    - name: Prepare kernel config
+      run: |
+        cd kernel_source
+        
+        echo "=== Preparing kernel configuration ==="
+        
+        # 查找可用的配置文件
+        echo "Available ARM64 configs:"
+        find arch/arm64/configs/ -name "*.config" -o -name "*defconfig" | sort
+        
+        # 选择配置文件的优先级
+        CONFIG_FILE=""
+        for config in "oneplus_defconfig" "gki_defconfig" "defconfig"; do
+          if [ -f "arch/arm64/configs/$config" ]; then
+            CONFIG_FILE="$config"
+            echo "Selected config: $CONFIG_FILE"
+            break
+          fi
+        done
+        
+        if [ -z "$CONFIG_FILE" ]; then
+          echo "No suitable config found, using default"
+          CONFIG_FILE="defconfig"
+        fi
+        
+        # 应用配置
+        echo "Applying kernel config: $CONFIG_FILE"
+        make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE $CONFIG_FILE
+        
+        # 修改配置以支持模块编译
+        echo "Configuring for module support..."
+        
+        # 使用sed直接修改.config文件，更可靠
+        sed -i 's/# CONFIG_MODULES is not set/CONFIG_MODULES=y/' .config || true
+        echo "CONFIG_MODULES=y" >> .config
+        echo "CONFIG_MODULE_UNLOAD=y" >> .config
+        echo "# CONFIG_MODVERSIONS is not set" >> .config
+        echo "# CONFIG_MODULE_SIG is not set" >> .config
+        echo "# CONFIG_MODULE_SIG_FORCE is not set" >> .config
+        
+        # 运行oldconfig来处理依赖
+        yes "" | make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE oldconfig
+        
+        echo "✓ Kernel configuration completed"
+        
+    - name: Prepare kernel for modules
+      run: |
+        cd kernel_source
+        
+        echo "=== Preparing kernel for module compilation ==="
+        
+        # 准备内核以支持外部模块编译
+        echo "Running modules_prepare..."
+        if ! make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE modules_prepare; then
+          echo "modules_prepare failed, trying scripts_basic + prepare..."
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE scripts_basic
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE prepare
+        fi
+        
+        # 确保关键文件存在
+        if [ ! -f scripts/mod/modpost ]; then
+          echo "Building modpost..."
+          make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE scripts
+        fi
+        
+        echo "✓ Kernel preparation completed"
+        
+    - name: Create optimized Makefile
       run: |
         cd rwProcMem33Module/rwProcMem_module
         
-        # Analyze kernel source
-        cd ../../kernel_source
-        echo "Searching for OPD2413 device configs..."
-        find . -type f -name "*opd*" -o -name "*OPD*" -o -name "*pad*" 2>/dev/null | head -10 || true
-        find arch/arm64/configs/ -name "*oneplus*" -o -name "*op*" 2>/dev/null | head -10 || true
+        # 备份原始Makefile
+        [ -f Makefile ] && cp Makefile Makefile.original
         
-        # Prepare kernel for module compilation
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-android31-
-        
-        # Try different configs in priority order
-        CONFIG_USED=""
-        if [ -f "arch/arm64/configs/oneplus_defconfig" ]; then
-          echo "Using oneplus_defconfig"
-          CONFIG_USED="oneplus_defconfig"
-        elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
-          echo "Using gki_defconfig"  
-          CONFIG_USED="gki_defconfig"
-        else
-          echo "Using defconfig"
-          CONFIG_USED="defconfig"
-        fi
-        
-        # Apply config with error handling
-        if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- $CONFIG_USED; then
-          echo "Config failed, trying generic arm64 defconfig..."
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- defconfig
-        fi
-        
-        # Enable module support
-        scripts/config --enable CONFIG_MODULES || echo "CONFIG_MODULES not found"
-        scripts/config --enable CONFIG_MODULE_UNLOAD || echo "CONFIG_MODULE_UNLOAD not found"
-        scripts/config --disable CONFIG_MODVERSIONS || echo "CONFIG_MODVERSIONS not found"
-        scripts/config --disable CONFIG_MODULE_SIG || echo "CONFIG_MODULE_SIG not found"
-        
-        # Prepare for module compilation with fallback
-        if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules_prepare; then
-          echo "modules_prepare failed, trying prepare..."
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- prepare
-        fi
-        
-        # Create build Makefile for module
-        cd ../rwProcMem33Module/rwProcMem_module
-        
-        # Backup original Makefile
-        if [ -f Makefile ]; then
-          cp Makefile Makefile.backup
-        fi
-        
+        # 创建优化的Makefile
         cat > Makefile << 'EOF'
-        # OnePlus Pad 2 Pro Official Kernel Module Makefile
-        KERNEL_SRC := $(PWD)/../../kernel_source
+# OnePlus Pad 2 Pro Kernel Module - Optimized Makefile
+KDIR := $(PWD)/../../kernel_source
+
+obj-m := rwProcMem_module.o
+
+# 兼容性标志
+ccflags-y += -DANDROID_VERSION=150000
+ccflags-y += -DPLATFORM_VERSION=15
+ccflags-y += -D__ANDROID__=1
+ccflags-y += -DCONFIG_ARM64=1
+
+# 禁用有问题的检查
+ccflags-y += -Wno-error
+ccflags-y += -Wno-implicit-function-declaration
+ccflags-y += -Wno-incompatible-pointer-types
+ccflags-y += -Wno-int-conversion
+ccflags-y += -Wno-format
+ccflags-y += -Wno-unused-variable
+ccflags-y += -Wno-unused-function
+
+# 内核兼容性
+ccflags-y += -fno-pic
+ccflags-y += -fno-pie
+
+# 调试标志
+ifdef DEBUG
+ccflags-y += -DDEBUG=1
+endif
+
+all:
+	@echo "=== Building rwProcMem_module.ko ==="
+	@echo "Target: OnePlus Pad 2 Pro (OPD2413)"
+	@echo "Kernel: $(shell cd $(KDIR) && make kernelversion 2>/dev/null || echo 'unknown')"
+	@echo "Cross compiler: $(CROSS_COMPILE)gcc"
+	$(MAKE) -C $(KDIR) M=$(PWD) \
+		ARCH=$(ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		CONFIG_MODULE_SIG= \
+		CONFIG_MODVERSIONS= \
+		modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) \
+		ARCH=$(ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		clean
+
+install: all
+	@echo "Module ready for installation"
+
+.PHONY: all clean install
+EOF
         
-        obj-m := rwProcMem_module.o
-        
-        # Android 15 compatibility flags
-        EXTRA_CFLAGS += -DANDROID_VERSION=150000
-        EXTRA_CFLAGS += -DPLATFORM_VERSION=15
-        EXTRA_CFLAGS += -D__ANDROID__
-        EXTRA_CFLAGS += -DCONFIG_ARM64
-        
-        # Disable problematic warnings
-        EXTRA_CFLAGS += -Wno-error
-        EXTRA_CFLAGS += -Wno-implicit-function-declaration
-        EXTRA_CFLAGS += -Wno-incompatible-pointer-types
-        EXTRA_CFLAGS += -Wno-int-conversion
-        
-        # Kernel compatibility  
-        EXTRA_CFLAGS += -fno-pic
-        EXTRA_CFLAGS += -fno-pie
-        
-        all:
-        	@echo "Building for kernel: $(shell cd $(KERNEL_SRC) && make kernelversion 2>/dev/null || echo 'unknown')"
-        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) \
-        		ARCH=arm64 \
-        		CROSS_COMPILE=aarch64-linux-android31- \
-        		CONFIG_MODULE_SIG=n \
-        		CONFIG_MODVERSIONS=n \
-        		modules
-        	
-        clean:
-        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- clean
-        EOF
+        echo "✓ Makefile created"
         
     - name: Build kernel module
       run: |
         cd rwProcMem33Module/rwProcMem_module
-        export ARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-android31-
         
-        echo "=== Building rwProcMem module ==="
-        echo "Kernel source: $(ls -la ../../kernel_source/ | head -5)"
-        echo "Current directory: $(pwd)"
-        echo "Makefile content:"
-        cat Makefile
-        echo "========================"
+        echo "=== Starting module compilation ==="
+        echo "Working directory: $(pwd)"
+        echo "Environment:"
+        echo "  ARCH=$ARCH"
+        echo "  CROSS_COMPILE=$CROSS_COMPILE"
+        echo "  Kernel source: $(readlink -f ../../kernel_source)"
         
-        # Build with verbose output
-        if ! make V=1; then
-          echo "=== Build failed, trying alternative approach ==="
+        # 验证编译环境
+        echo "Compiler check:"
+        ${CROSS_COMPILE}gcc --version | head -1
+        
+        echo "Kernel source check:"
+        ls -la ../../kernel_source/
+        
+        echo "Module source files:"
+        ls -la *.c *.h
+        
+        # 第一次尝试：使用我们的Makefile
+        echo "=== Attempt 1: Using custom Makefile ==="
+        if make all; then
+          echo "✓ Compilation successful with custom Makefile"
+        else
+          echo "✗ Custom Makefile failed, trying fallbacks..."
           
-          # Try with original Makefile if backup exists
-          if [ -f Makefile.backup ]; then
-            echo "Restoring original Makefile..."
-            cp Makefile.backup Makefile
+          # 第二次尝试：使用原始Makefile
+          if [ -f Makefile.original ]; then
+            echo "=== Attempt 2: Using original Makefile ==="
+            cp Makefile.original Makefile
+            if make all; then
+              echo "✓ Compilation successful with original Makefile"
+            fi
           fi
           
-          # Try direct kernel module compilation
-          echo "Trying direct compilation..."
-          cd ../../kernel_source
-          
-          # Compile the module directly in kernel build system
-          echo "obj-m += rwProcMem33Module/rwProcMem_module/rwProcMem_module.o" >> Makefile
-          
-          if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- M=. modules; then
-            echo "=== All build methods failed ==="
-            echo "Kernel version info:"
-            make kernelversion 2>/dev/null || echo "Cannot determine kernel version"
-            echo "Available configs:"
-            find arch/arm64/configs/ -name "*.config" -o -name "*defconfig" | head -10
-            exit 1
+          # 第三次尝试：直接使用内核构建系统
+          if [ ! -f rwProcMem_module.ko ]; then
+            echo "=== Attempt 3: Direct kernel build ==="
+            cd ../../kernel_source
+            
+            # 创建一个临时的模块目录链接
+            ln -sf ../rwProcMem33Module/rwProcMem_module ./temp_module
+            
+            # 直接编译
+            make ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE M=temp_module modules
+            
+            # 复制结果
+            if [ -f temp_module/rwProcMem_module.ko ]; then
+              cp temp_module/rwProcMem_module.ko ../rwProcMem33Module/rwProcMem_module/
+            fi
+            
+            rm -f temp_module
+            cd ../rwProcMem33Module/rwProcMem_module
           fi
           
-          # Copy result back
-          find . -name "rwProcMem_module.ko" -exec cp {} ../rwProcMem33Module/rwProcMem_module/ \;
-          cd ../rwProcMem33Module/rwProcMem_module
+          # 第四次尝试：简化编译
+          if [ ! -f rwProcMem_module.ko ]; then
+            echo "=== Attempt 4: Simplified compilation ==="
+            
+            cat > simple_Makefile << 'EOF'
+obj-m := rwProcMem_module.o
+KDIR := ../../kernel_source
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+EOF
+            
+            make -f simple_Makefile ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE
+          fi
         fi
         
-        # Check if build succeeded
+        # 验证编译结果
         if [ -f rwProcMem_module.ko ]; then
-          echo "✓ Build successful!"
+          echo "🎉 SUCCESS: Module compiled successfully!"
+          echo ""
+          echo "Module information:"
           file rwProcMem_module.ko
-          ls -la *.ko
-          echo "Module info:"
-          modinfo rwProcMem_module.ko || echo "modinfo not available"
+          ls -lh rwProcMem_module.ko
+          
+          # 尝试获取模块信息
+          if command -v modinfo >/dev/null 2>&1; then
+            echo ""
+            echo "Module details:"
+            modinfo rwProcMem_module.ko || echo "Could not get module info"
+          fi
+          
         else
-          echo "✗ Build failed - no .ko file generated!"
-          echo "Files in current directory:"
+          echo "❌ FAILED: No .ko file generated"
+          echo ""
+          echo "Build artifacts:"
           ls -la
+          echo ""
+          echo "Checking for partial builds:"
+          find . -name "*.o" -o -name "*.mod*" | head -10
+          
           exit 1
         fi
         
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
+      if: success()
       with:
-        name: rwProcMem33-module-OPD2413
+        name: rwProcMem33-module-${{ github.run_number }}
         path: |
           rwProcMem33Module/rwProcMem_module/*.ko
           rwProcMem33Module/rwProcMem_module/Module.symvers
+        retention-days: 30
           
     - name: Create release info
+      if: success()
       run: |
         cd rwProcMem33Module/rwProcMem_module
-        echo "# OnePlus Pad 2 Pro Official Kernel Build" > build_info.txt
-        echo "Device: OnePlus Pad 2 Pro (OPD2413)" >> build_info.txt
-        echo "Target Kernel: 6.6.57-android15-8-g4dc61d72e02f" >> build_info.txt
-        echo "Kernel Source: OnePlus Official SM8750" >> build_info.txt
-        echo "Repository: OnePlusOSS/android_kernel_common_oneplus_sm8750" >> build_info.txt
-        echo "Architecture: arm64-v8a" >> build_info.txt
-        echo "Android Version: 15" >> build_info.txt
-        echo "Build Date: $(date)" >> build_info.txt
-        echo "Compiler: $(aarch64-linux-android31-clang --version | head -1)" >> build_info.txt
-        echo "" >> build_info.txt
-        echo "Kernel Source Info:" >> build_info.txt
-        cd ../../kernel_source
-        echo "Latest Commit: $(git log --oneline -1)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
-        echo "Branch: $(git branch --show-current)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
-        cd ../rwProcMem33Module/rwProcMem_module
         
         if [ -f rwProcMem_module.ko ]; then
-          echo "Module Size: $(stat -c%s rwProcMem_module.ko) bytes" >> build_info.txt
-          echo "Module Info:" >> build_info.txt
-          modinfo rwProcMem_module.ko >> build_info.txt 2>/dev/null || true
+          echo "# ${{ env.TARGET_DEVICE }} Kernel Module Build Report" > build_info.txt
+          echo "## Build Information" >> build_info.txt
+          echo "- **Device**: ${{ env.TARGET_DEVICE }}" >> build_info.txt
+          echo "- **Kernel Version**: ${{ env.KERNEL_VERSION }}" >> build_info.txt
+          echo "- **Android Version**: ${{ env.ANDROID_VERSION }}" >> build_info.txt
+          echo "- **Architecture**: arm64" >> build_info.txt
+          echo "- **Build Date**: $(date -u)" >> build_info.txt
+          echo "- **Build Number**: ${{ github.run_number }}" >> build_info.txt
+          echo "- **Commit**: ${{ github.sha }}" >> build_info.txt
+          echo "" >> build_info.txt
+          
+          echo "## Compiler Information" >> build_info.txt
+          echo '```' >> build_info.txt
+          ${CROSS_COMPILE}gcc --version | head -3 >> build_info.txt
+          echo '```' >> build_info.txt
+          echo "" >> build_info.txt
+          
+          echo "## Kernel Source" >> build_info.txt
+          cd ../../kernel_source
+          echo "- **Repository**: $(git config --get remote.origin.url)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
+          echo "- **Latest Commit**: $(git log --oneline -1)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
+          echo "- **Branch**: $(git branch --show-current 2>/dev/null || echo 'detached')" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
+          cd ../rwProcMem33Module/rwProcMem_module
+          echo "" >> build_info.txt
+          
+          echo "## Module Information" >> build_info.txt
+          echo "- **File Size**: $(stat -c%s rwProcMem_module.ko) bytes" >> build_info.txt
+          echo "- **File Hash**: $(sha256sum rwProcMem_module.ko | cut -d' ' -f1)" >> build_info.txt
+          echo "" >> build_info.txt
+          
+          if command -v modinfo >/dev/null 2>&1; then
+            echo "## Module Details" >> build_info.txt
+            echo '```' >> build_info.txt
+            modinfo rwProcMem_module.ko >> build_info.txt 2>/dev/null || echo "Module info not available" >> build_info.txt
+            echo '```' >> build_info.txt
+          fi
+          
+          echo "" >> build_info.txt
+          echo "## Installation Instructions" >> build_info.txt
+          echo "1. Download the module: \`rwProcMem_module.ko\`" >> build_info.txt
+          echo "2. Push to device: \`adb push rwProcMem_module.ko /data/local/tmp/\`" >> build_info.txt
+          echo "3. Load module: \`adb shell su -c 'insmod /data/local/tmp/rwProcMem_module.ko'\`" >> build_info.txt
+          echo "4. Verify: \`adb shell lsmod | grep rwProcMem\`" >> build_info.txt
+          
+        else
+          echo "ERROR: rwProcMem_module.ko not found!" > build_info.txt
         fi
         
     - name: Upload build info
