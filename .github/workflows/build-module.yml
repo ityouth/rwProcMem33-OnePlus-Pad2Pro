@@ -1,0 +1,148 @@
+name: Build rwProcMem33 Module for OnePlus Pad 2 Pro
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential git bc bison flex libssl-dev libncurses5-dev curl
+        
+    - name: Download Android NDK
+      run: |
+        cd /tmp
+        wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip
+        unzip -q android-ndk-r26c-linux.zip
+        sudo mv android-ndk-r26c /opt/
+        echo "/opt/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        
+    - name: Download OnePlus Official Kernel Source
+      run: |
+        echo "Downloading OnePlus Official SM8750 kernel source..."
+        git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git kernel_source
+        cd kernel_source
+        echo "Available branches:"
+        git branch -a | head -10
+        echo "Latest commit:"
+        git log --oneline -1
+        
+    - name: Prepare module build
+      run: |
+        cd rwProcMem33Module/rwProcMem_module
+        
+        # Analyze kernel source
+        cd ../../kernel_source
+        echo "Searching for OPD2413 device configs..."
+        find . -type f -name "*opd*" -o -name "*OPD*" -o -name "*pad*" 2>/dev/null | head -10 || true
+        find arch/arm64/configs/ -name "*oneplus*" -o -name "*op*" 2>/dev/null | head -10 || true
+        
+        # Prepare kernel for module compilation
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-android31-
+        
+        # Try different configs in priority order
+        if [ -f "arch/arm64/configs/oneplus_defconfig" ]; then
+          echo "Using oneplus_defconfig"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- oneplus_defconfig
+        elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
+          echo "Using gki_defconfig"  
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- gki_defconfig
+        else
+          echo "Using defconfig"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- defconfig
+        fi
+        
+        # Enable module support
+        scripts/config --enable CONFIG_MODULES || true
+        scripts/config --enable CONFIG_MODULE_UNLOAD || true
+        scripts/config --enable CONFIG_MODVERSIONS || true
+        
+        # Prepare for module compilation
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules_prepare
+        
+        # Create build Makefile for module
+        cd ../rwProcMem33Module/rwProcMem_module
+        cat > Makefile << 'EOF'
+        # OnePlus Pad 2 Pro Official Kernel Module Makefile
+        KERNEL_SRC := $(PWD)/../../kernel_source
+        
+        obj-m := rwProcMem_module.o
+        
+        EXTRA_CFLAGS += -DANDROID_VERSION=150000
+        EXTRA_CFLAGS += -DPLATFORM_VERSION=15
+        EXTRA_CFLAGS += -Wno-error
+        
+        all:
+        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules
+        	
+        clean:
+        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 clean
+        EOF
+        
+    - name: Build kernel module
+      run: |
+        cd rwProcMem33Module/rwProcMem_module
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-android31-
+        
+        echo "Building rwProcMem module..."
+        make
+        
+        # Check if build succeeded
+        if [ -f rwProcMem_module.ko ]; then
+          echo "✓ Build successful!"
+          file rwProcMem_module.ko
+          ls -la *.ko
+        else
+          echo "✗ Build failed!"
+          exit 1
+        fi
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: rwProcMem33-module-OPD2413
+        path: |
+          rwProcMem33Module/rwProcMem_module/*.ko
+          rwProcMem33Module/rwProcMem_module/Module.symvers
+          
+    - name: Create release info
+      run: |
+        cd rwProcMem33Module/rwProcMem_module
+        echo "# OnePlus Pad 2 Pro Official Kernel Build" > build_info.txt
+        echo "Device: OnePlus Pad 2 Pro (OPD2413)" >> build_info.txt
+        echo "Target Kernel: 6.6.57-android15-8-g4dc61d72e02f" >> build_info.txt
+        echo "Kernel Source: OnePlus Official SM8750" >> build_info.txt
+        echo "Repository: OnePlusOSS/android_kernel_common_oneplus_sm8750" >> build_info.txt
+        echo "Architecture: arm64-v8a" >> build_info.txt
+        echo "Android Version: 15" >> build_info.txt
+        echo "Build Date: $(date)" >> build_info.txt
+        echo "Compiler: $(aarch64-linux-android31-clang --version | head -1)" >> build_info.txt
+        echo "" >> build_info.txt
+        echo "Kernel Source Info:" >> build_info.txt
+        cd ../../kernel_source
+        echo "Latest Commit: $(git log --oneline -1)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
+        echo "Branch: $(git branch --show-current)" >> ../rwProcMem33Module/rwProcMem_module/build_info.txt
+        cd ../rwProcMem33Module/rwProcMem_module
+        
+        if [ -f rwProcMem_module.ko ]; then
+          echo "Module Size: $(stat -c%s rwProcMem_module.ko) bytes" >> build_info.txt
+          echo "Module Info:" >> build_info.txt
+          modinfo rwProcMem_module.ko >> build_info.txt 2>/dev/null || true
+        fi
+        
+    - name: Upload build info
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-info
+        path: rwProcMem33Module/rwProcMem_module/build_info.txt
