@@ -1,5 +1,9 @@
 ﻿#ifndef RWPROCMEM_H_
 #define RWPROCMEM_H_
+
+/* 内核兼容性修复 - 必须在其他头文件之前 */
+#include "kernel_compat.h"
+
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/types.h>

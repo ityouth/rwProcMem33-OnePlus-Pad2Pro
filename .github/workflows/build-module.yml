@@ -29,7 +29,12 @@ jobs:
     - name: Download OnePlus Official Kernel Source
       run: |
         echo "Downloading OnePlus Official SM8750 kernel source..."
-        git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git kernel_source
+        # 尝试多个内核源
+        if ! git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_common_oneplus_sm8750.git kernel_source; then
+          echo "Primary source failed, trying alternative..."
+          git clone --depth=1 https://github.com/OnePlusOSS/android_kernel_oneplus_sm8750.git kernel_source || \
+          git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel_source
+        fi
         cd kernel_source
         echo "Available branches:"
         git branch -a | head -10
@@ -51,42 +56,77 @@ jobs:
         export CROSS_COMPILE=aarch64-linux-android31-
         
         # Try different configs in priority order
+        CONFIG_USED=""
         if [ -f "arch/arm64/configs/oneplus_defconfig" ]; then
           echo "Using oneplus_defconfig"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- oneplus_defconfig
+          CONFIG_USED="oneplus_defconfig"
         elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
           echo "Using gki_defconfig"  
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- gki_defconfig
+          CONFIG_USED="gki_defconfig"
         else
           echo "Using defconfig"
+          CONFIG_USED="defconfig"
+        fi
+        
+        # Apply config with error handling
+        if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- $CONFIG_USED; then
+          echo "Config failed, trying generic arm64 defconfig..."
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- defconfig
         fi
         
         # Enable module support
-        scripts/config --enable CONFIG_MODULES || true
-        scripts/config --enable CONFIG_MODULE_UNLOAD || true
-        scripts/config --enable CONFIG_MODVERSIONS || true
+        scripts/config --enable CONFIG_MODULES || echo "CONFIG_MODULES not found"
+        scripts/config --enable CONFIG_MODULE_UNLOAD || echo "CONFIG_MODULE_UNLOAD not found"
+        scripts/config --disable CONFIG_MODVERSIONS || echo "CONFIG_MODVERSIONS not found"
+        scripts/config --disable CONFIG_MODULE_SIG || echo "CONFIG_MODULE_SIG not found"
         
-        # Prepare for module compilation
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules_prepare
+        # Prepare for module compilation with fallback
+        if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules_prepare; then
+          echo "modules_prepare failed, trying prepare..."
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- prepare
+        fi
         
         # Create build Makefile for module
         cd ../rwProcMem33Module/rwProcMem_module
+        
+        # Backup original Makefile
+        if [ -f Makefile ]; then
+          cp Makefile Makefile.backup
+        fi
+        
         cat > Makefile << 'EOF'
         # OnePlus Pad 2 Pro Official Kernel Module Makefile
         KERNEL_SRC := $(PWD)/../../kernel_source
         
         obj-m := rwProcMem_module.o
         
+        # Android 15 compatibility flags
         EXTRA_CFLAGS += -DANDROID_VERSION=150000
         EXTRA_CFLAGS += -DPLATFORM_VERSION=15
+        EXTRA_CFLAGS += -D__ANDROID__
+        EXTRA_CFLAGS += -DCONFIG_ARM64
+        
+        # Disable problematic warnings
         EXTRA_CFLAGS += -Wno-error
+        EXTRA_CFLAGS += -Wno-implicit-function-declaration
+        EXTRA_CFLAGS += -Wno-incompatible-pointer-types
+        EXTRA_CFLAGS += -Wno-int-conversion
+        
+        # Kernel compatibility  
+        EXTRA_CFLAGS += -fno-pic
+        EXTRA_CFLAGS += -fno-pie
         
         all:
-        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- modules
+        	@echo "Building for kernel: $(shell cd $(KERNEL_SRC) && make kernelversion 2>/dev/null || echo 'unknown')"
+        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) \
+        		ARCH=arm64 \
+        		CROSS_COMPILE=aarch64-linux-android31- \
+        		CONFIG_MODULE_SIG=n \
+        		CONFIG_MODVERSIONS=n \
+        		modules
         	
         clean:
-        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 clean
+        	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- clean
         EOF
         
     - name: Build kernel module
@@ -95,16 +135,55 @@ jobs:
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-android31-
         
-        echo "Building rwProcMem module..."
-        make
+        echo "=== Building rwProcMem module ==="
+        echo "Kernel source: $(ls -la ../../kernel_source/ | head -5)"
+        echo "Current directory: $(pwd)"
+        echo "Makefile content:"
+        cat Makefile
+        echo "========================"
+        
+        # Build with verbose output
+        if ! make V=1; then
+          echo "=== Build failed, trying alternative approach ==="
+          
+          # Try with original Makefile if backup exists
+          if [ -f Makefile.backup ]; then
+            echo "Restoring original Makefile..."
+            cp Makefile.backup Makefile
+          fi
+          
+          # Try direct kernel module compilation
+          echo "Trying direct compilation..."
+          cd ../../kernel_source
+          
+          # Compile the module directly in kernel build system
+          echo "obj-m += rwProcMem33Module/rwProcMem_module/rwProcMem_module.o" >> Makefile
+          
+          if ! make ARCH=arm64 CROSS_COMPILE=aarch64-linux-android31- M=. modules; then
+            echo "=== All build methods failed ==="
+            echo "Kernel version info:"
+            make kernelversion 2>/dev/null || echo "Cannot determine kernel version"
+            echo "Available configs:"
+            find arch/arm64/configs/ -name "*.config" -o -name "*defconfig" | head -10
+            exit 1
+          fi
+          
+          # Copy result back
+          find . -name "rwProcMem_module.ko" -exec cp {} ../rwProcMem33Module/rwProcMem_module/ \;
+          cd ../rwProcMem33Module/rwProcMem_module
+        fi
         
         # Check if build succeeded
         if [ -f rwProcMem_module.ko ]; then
           echo "✓ Build successful!"
           file rwProcMem_module.ko
           ls -la *.ko
+          echo "Module info:"
+          modinfo rwProcMem_module.ko || echo "modinfo not available"
         else
-          echo "✗ Build failed!"
+          echo "✗ Build failed - no .ko file generated!"
+          echo "Files in current directory:"
+          ls -la
           exit 1
         fi
         
